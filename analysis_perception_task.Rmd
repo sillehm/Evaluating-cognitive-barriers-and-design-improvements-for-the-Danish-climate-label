@@ -1,0 +1,615 @@
+---
+title: "clean_perception_analysis"
+author: "Sille Hasselbalch Markussen"
+date: "5/13/2025"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+pacman::p_load('tidyverse', 'lme4', 'lmerTest', 'ordinal', 'ggeffects', 'car', 'stringr', 'dplyr', 'scales')
+
+```
+
+# Data load and preprocessing
+```{r message=FALSE}
+# Define the path to your folder
+folder_path <- "perception2904"
+
+# Get a list of all CSV files in that folder
+csv_files <- list.files(path = folder_path, pattern = "*.csv", full.names = TRUE)
+
+# Read and combine them into one dataframe
+df <- csv_files %>%
+  map_dfr(read_csv, show_col_types = FALSE)
+```
+
+PReprocessing
+```{r}
+# remove test trial (first 3 trials for each participant)
+df <- df %>%
+  group_by(participantID) %>%
+  mutate(row_in_group = row_number()) %>%
+  filter(row_in_group > 3) %>%
+  select(-row_in_group) %>%
+  ungroup()
+```
+
+```{r}
+df <- df %>%
+  mutate(
+    labelPosition = as.factor(labelPosition),
+    labelType = as.factor(labelType),
+    brand = as.factor(brand),
+    participantID = as.factor(participantID),
+    accuracy = if_else(brand == labelType, 1, 0),
+    labelPosition = dplyr::recode(labelPosition,
+                                "U" = "byLabels",
+                                "D" = "byPrice")
+  )
+```
+
+Identifying outliers
+```{r}
+# Log-transform Reaction Times
+df <- df %>%
+  mutate(log_rt = log(reactionTime))
+
+# Calculate Log Mean and SD (for Trimming)
+log_mean <- mean(df$log_rt, na.rm = TRUE)
+log_sd <- sd(df$log_rt, na.rm = TRUE)
+
+# Trim Trials Outside ±2.5 SD on Log Scale
+df_trimmed <- df %>%
+  filter(log_rt >= (log_mean - 2.5 * log_sd),
+         log_rt <= (log_mean + 2.5 * log_sd))
+```
+
+
+
+# Models
+
+## Reaction time
+
+Label position
+```{r}
+df_trimmed$labelPosition <- relevel(df_trimmed$labelPosition, ref = "byLabels")
+rt_position <- lmer(log_rt ~ labelPosition + (1 | participantID), data = df_trimmed)
+
+rt_position_slope <- lmer(log_rt ~ labelPosition + (1 + labelPosition| participantID), data = df_trimmed)
+
+anova(rt_position, rt_position_slope, test = "Chisq")
+```
+
+```{r}
+summary(rt_position)
+```
+
+Number of other labels
+```{r}
+rt_nLabels <- lmer(log_rt ~ n_labels + (1 | participantID), data = df_trimmed)
+rt_nLabels_slope <- lmer(log_rt ~ n_labels + (1 + n_labels | participantID), data = df_trimmed)
+
+# testing for the better model
+anova(rt_nLabels, rt_nLabels_slope, test = "Chisq")
+```
+
+```{r}
+summary(rt_nLabels)
+```
+
+Placement * n labels
+```{r}
+rt_interaction <- lmer(log_rt ~ n_labels:labelPosition + (1 | participantID), data = df_trimmed)
+summary(rt_interaction)
+```
+
+
+## Accuracy
+
+Label position
+```{r}
+ac_position <- glmer(accuracy ~ labelPosition + (1 | participantID), data = df_trimmed, family = binomial) 
+ac_position_slope <- glmer(accuracy ~ labelPosition + (1 + labelPosition | participantID), data = df_trimmed, family = binomial) 
+
+# checking for the best model
+anova(ac_position, ac_position_slope, test = "Chisq")
+```
+
+```{r}
+summary(ac_position_slope)
+```
+
+Number of labels
+```{r}
+ac_nLabels <- glmer(accuracy ~ n_labels + (1 | participantID), data = df_trimmed, family = binomial) 
+ac_nLabels_slope <- glmer(accuracy ~ n_labels + (1 + n_labels | participantID), data = df_trimmed, family = binomial) 
+
+# testing for the best model
+anova(ac_nLabels, ac_nLabels_slope, test = "Chisq")
+```
+
+```{r}
+summary(ac_nLabels)
+```
+
+Placement * n labels
+```{r}
+ac_interaction <- lmer(accuracy ~ n_labels:labelPosition + (1 | participantID), data = df_trimmed)
+summary(ac_interaction)
+```
+
+
+# Plots - REPORT
+
+RT Number of labels
+```{r}
+plot_data <- ggpredict(rt_nLabels, terms = "n_labels")
+
+plot_data$predicted_ms <- exp(plot_data$predicted)
+plot_data$predicted_s <- plot_data$predicted_ms/1000
+
+ggplot(plot_data, aes(x = x, y = predicted_s)) +
+  geom_line(size = 1.5, color = "#095979") +  # Line in stakeholder blue
+  annotate("text", x = 4, y = 3.790, label = "+ 3,1%", color = "#095979", 
+           fontface = "bold", family = "Times", size = 4, hjust = -0.2, vjust = 0.5) +
+  scale_x_continuous(limits = c(0, 4), breaks = 0:4, expand = c(0, 0)) +
+  coord_cartesian(ylim = c(3.5, 4), clip = "off") +
+  scale_y_continuous(labels = comma_format(decimal.mark = ","))+
+  labs(
+    x = "Antal andre mærker",
+    y = "Svartid (sekunder)"
+  ) +
+  theme_minimal(base_size = 14, base_family = "Times") +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    plot.background = element_blank(),
+    axis.line = element_line(color = "#095979"),    
+    axis.ticks.y = element_line(color = "#095979"),  
+    axis.ticks.x = element_blank(),                  
+    axis.title = element_text(color = "#095979"),
+    axis.text = element_text(color = "#095979"),
+    plot.margin = margin(5.5, 60, 5.5, 5.5), 
+    plot.title = element_blank()
+  )
+
+ggsave('rt_nLabels_plot.png', bg = "transparent", width = 6, height = 4, dpi = 300)
+```
+
+ACC Number of labels
+```{r}
+plot_acc_nlabels <- ggpredict(ac_nLabels, terms = "n_labels")
+
+ggplot(plot_acc_nlabels, aes(x = x, y = predicted)) +
+  geom_line(size = 1.5, color = "#095979") +  
+  annotate("text", x = 4, y = 0.95, label = "- 2,1 pp", color = "#095979", 
+           fontface = "bold", family = "Times", size = 4, hjust = -0.2, vjust = 0.5) +
+  scale_x_continuous(limits = c(0, 4),breaks = 0:4, expand = c(0, 0)) +
+  coord_cartesian( clip = "off") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0.8, 1)) +
+  labs(
+    x = "Antal andre mærker",
+    y = "Andel af korrekte klimamærker"
+  ) +
+  theme_minimal(base_size = 14, base_family = "Times") +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    plot.background = element_blank(),
+    axis.line = element_line(color = "#095979"),    
+    axis.ticks.y = element_line(color = "#095979"), 
+    axis.ticks.x = element_blank(),                 
+    axis.title = element_text( color = "#095979"),
+    axis.text = element_text(color = "#095979"),
+    plot.margin = margin(5.5, 60, 5.5, 5.5),  
+    plot.title = element_blank()
+  )
+
+
+ggsave('acc_nLabels_plot.png', bg = "transparent", width = 6, height = 4, dpi = 300)
+```
+
+RT Interaction
+```{r}
+plot_data_interaction$predicted_s <- plot_data_interaction$predicted_ms/1000
+
+ggplot(plot_data_interaction, aes(x = x, y = predicted_s, color = group)) +
+  geom_line(size = 1.5) +
+  scale_color_manual(
+    values = c(
+      "byLabels" = "#007A6C",   # teal
+      "byPrice" = "#C29F36"     # gold
+    )
+  ) +
+  labs(
+    x = "Antal andre mærker",
+    y = "Svartid (sekunder)"
+  ) +
+  # Percent annotations (slightly above end of each line)
+  annotate("text", x = 4.05, y = 3.795, label = "+3,4 %", 
+           color = "#007A6C", fontface = "bold", family = "Times", hjust = 0) +
+  annotate("text", x = 4.05, y = 3.765, label = "+2,7 %", 
+           color = "#C29F36", fontface = "bold", family = "Times", hjust = 0) +
+  #annotate("text", x = 1.1, y = 3640, label = "18% lavere stigning*", 
+  #       color = "#034D69", fontface = "italic", family = "Times", hjust = 0.5)+
+  scale_x_continuous(breaks = 0:4, expand = c(0, 0)) +
+  scale_y_continuous(labels = comma_format(decimal.mark = ","))+
+  coord_cartesian(ylim = c(3.5, 4), clip = "off") +
+  theme_minimal(base_size = 14, base_family = "Times") +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+    plot.background = element_blank(),
+    legend.position = "none",
+    plot.margin = margin(5.5, 80, 5.5, 5.5),  # top, right, bottom, left
+    axis.title = element_text( color = "#034D69"),
+    axis.text = element_text(color = "#034D69"),
+    axis.line = element_line(color = "#034D69", linewidth = 0.6),  # add axis lines
+    axis.ticks.y = element_line(color = "#034D69")                   # add tick marks
+  )
+
+ggsave("interaction_plot_rt.png", width = 6.5, height = 4, dpi = 300, bg = "transparent")
+```
+
+ACC Interaction
+```{r}
+ggplot(plot_acc_interaction, aes(x = x, y = predicted, color = group)) +
+  geom_line(size = 1.5) +
+  scale_color_manual(
+    values = c(
+      "byLabels" = "#007A6C",   # teal 
+      "byPrice" = "#C29F36"     # gold 
+    )
+  ) +
+  labs(
+    x = "Antal andre mærker",
+    y = "Andel af korrekte klimamærker"
+  ) +
+  geom_text(
+    data = subset(plot_acc_interaction, x == max(x)),
+    aes(
+      y = predicted - c(0.0098, 0.0108),
+      label = c("Blandt mærker", "Ved prisen")
+    ),
+    color = c("#007A6C", "#C29F36"),
+    hjust = -0.05,
+    fontface = "bold",
+    family = "Times"
+  ) +
+  annotate("text", x = 4.05, y = 0.89, label = "-6 pp", 
+           color = "#007A6C", fontface = "bold", family = "Times", hjust = 0) +
+  annotate("text", x = 4.05, y = 0.935, label = "-0,9 pp", 
+           color = "#C29F36", fontface = "bold", family = "Times", hjust = 0) +
+  scale_x_continuous(breaks = 0:4, expand = c(0, 0)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0.8, 1)) +
+  coord_cartesian(clip = "off") +
+  theme_minimal(base_size = 14, base_family = "Times") +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+    plot.background = element_blank(),
+    legend.position = "none",
+    plot.margin = margin(5.5, 80, 5.5, 5.5),  
+    axis.title = element_text( color = "#034D69"),
+    axis.text = element_text(color = "#034D69"),
+    axis.line = element_line(color = "#034D69", linewidth = 0.6), 
+    axis.ticks.y = element_line(color = "#034D69")                  
+  )
+
+ggsave('acc_interaction_plot.png', width = 6.5, height = 4, dpi = 300, bg = "transparent")
+```
+
+
+# Plots - THESIS
+
+RT Placement
+```{r}
+# Create predicted data
+plot_rt_position <- ggpredict(rt_position, terms = c( "labelPosition"))
+
+# Back-transform to milliseconds
+plot_rt_position$predicted <- exp(plot_rt_position$predicted)
+plot_rt_position$conf.low  <- exp(plot_rt_position$conf.low)
+plot_rt_position$conf.high <- exp(plot_rt_position$conf.high)
+
+
+# Plot
+ggplot(plot_rt_position, aes(x = x, y = predicted, color = x)) +
+  geom_point(position = position_dodge(0.5), size = 2.5) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.1, position = position_dodge(0.5)) +
+  scale_color_manual(
+    values = c("byLabels" = "#344D69",
+               "byPrice" = "#E6C24B"),
+    labels = c("By other labels", "By the price")
+  ) +
+  labs(
+    x = "",
+    y = "Predicted Response Time (ms)",
+    color = "Label position"
+  ) +
+  guides(color = guide_legend(override.aes = list(linetype = 0,
+                                                  shape = 16,
+                                                  size = 3),
+                              label.position = "right",           
+                              keywidth = unit(-5, "cm"),       
+                              default.unit = "cm"))+
+  coord_cartesian(ylim = c(3000, 4500)) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8),
+    axis.text.x = element_blank()
+  )
+
+ggsave("thesis_figures/rt_position_pointPlot.png", width = 5, height = 4, dpi = 300)
+```
+
+ACC Placement
+```{r}
+plot_acc_position <- ggpredict(ac_position_slope, terms = c( "labelPosition"))
+
+ggplot(plot_acc_position, aes(x = x, y = predicted, color = x)) +
+  geom_point(position = position_dodge(0.5), size = 2.5) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.1, position = position_dodge(0.5)) +
+  scale_color_manual(
+    values = c("byLabels" = "#344D69",
+               "byPrice" = "#E6C24B"),
+    labels = c("By other labels", "By the price")
+  ) +
+  labs(
+    x = "",
+    y = "Predicted Accuracy",
+    color = "Label position"
+  ) +
+  guides(color = guide_legend(override.aes = list(linetype = 0,
+                                                  shape = 16,
+                                                  size = 3),
+                              label.position = "right",           
+                              keywidth = unit(-5, "cm"),         
+                              default.unit = "cm"))+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0.8, 1)) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8),
+    axis.text.x = element_blank()
+  )
+
+ggsave("thesis_figures/acc_position_pointPlot.png", width = 5, height = 4, dpi = 300)
+
+```
+
+RT n labels
+```{r}
+plot_data <- ggpredict(rt_nLabels, terms = "n_labels")
+
+plot_data$predicted_ms <- exp(plot_data$predicted)
+plot_data$conf.low_ms <- exp(plot_data$conf.low)
+plot_data$conf.high_ms <- exp(plot_data$conf.high)
+
+ggplot(plot_data, aes(x = x, y = predicted_ms)) +
+  geom_line(color = "#84bf7c", size = 1.2) +
+  geom_ribbon(aes(ymin = conf.low_ms, ymax = conf.high_ms), fill = "#84bf7c", alpha = 0.2) +
+  coord_cartesian(ylim = c(3000, 4500)) +
+  labs(
+    x = "Number of Other Labels",
+    y = "Predicted Reaxtion Time (ms)"
+  ) +
+  theme_minimal()
+
+ggsave("thesis_figures/rt_nLabels_pointPlot.png", width = 5, height = 4, dpi = 300)
+```
+
+ACC n labels
+```{r}
+# Predictions
+plot_acc_nlabels <- ggpredict(ac_nLabels, terms = "n_labels")
+
+# Plot
+ggplot(plot_acc_nlabels, aes(x = x, y = predicted)) +
+  geom_line(color = "#8BC17A", size = 1.2) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), fill = "#8BC17A", alpha = 0.2) +
+  labs(x = "Number of other labels", y = "Predicted accuracy") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0.8, 1)) +
+  theme_minimal()
+
+ggsave("thesis_figures/acc_nLabels_pointPlot.png", width = 5, height = 4, dpi = 300)
+```
+
+
+RT interaction
+```{r}
+plot_data_interaction <- ggpredict(rt_interaction, terms = c("n_labels", "labelPosition"))
+
+plot_data_interaction$group <- factor(
+  plot_data_interaction$group,
+  levels = c("byLabels", "byPrice")
+)
+
+plot_data_interaction$predicted_ms <- exp(plot_data_interaction$predicted)
+plot_data_interaction$conf.low_ms <- exp(plot_data_interaction$conf.low)
+plot_data_interaction$conf.high_ms <- exp(plot_data_interaction$conf.high)
+
+ggplot(plot_data_interaction, aes(x = x, y = predicted_ms, color = group, fill = group)) +
+  geom_line(size = 1.2) +
+  geom_ribbon(aes(ymin = conf.low_ms, ymax = conf.high_ms), alpha = 0.2, colour=NA) +
+  scale_color_manual(
+    values = c("byLabels" = "#034D69", "byPrice" = "#e4c358"),
+    labels = c("byLabels" = "By other labels", "byPrice" = "By the price")
+  ) +
+  scale_fill_manual(
+    values = c("byLabels" = "#034D69", "byPrice" = "#e4c358"),
+    labels = c("byLabels" = "By other labels", "byPrice" = "By the price")
+  ) +
+  labs(
+    x = "Number of Labels",
+    y = "Predicted Reaction Time (ms)",
+    color = "Label Position",
+    fill = "Label Position"
+  ) +
+  coord_cartesian(ylim = c(3000, 4500), clip = "off") +
+  theme_minimal()
+
+ggsave('rt_interaction_plot.png', bg = "transparent", width = 6, height = 4, dpi = 300)
+```
+
+ACC interaction
+```{r}
+plot_acc_interaction <- ggpredict(ac_interaction, terms = c("n_labels", "labelPosition"))
+
+plot_acc_interaction$group <- factor(
+  plot_acc_interaction$group,
+  levels = c("byPrice", "byLabels")
+)
+
+# Plot
+ggplot(plot_acc_interaction, aes(x = x, y = predicted, color = group, fill = group)) +
+  geom_line(size = 1.2) +
+  geom_ribbon(aes(ymin = conf.low, ymax = conf.high), alpha = 0.2, color = NA) +
+  scale_color_manual(
+    values = c("byLabels" = "#034D69", "byPrice" = "#e4c358"),
+    labels = c("byLabels" = "By the other labels", "byPrice" = "By the price")
+  ) +
+  scale_fill_manual(
+    values = c("byLabels" = "#034D69", "byPrice" = "#e4c358"),
+    labels = c("byLabels" = "By the other labels", "byPrice" = "By the price")
+  ) +
+  labs(
+    x = "Number of Labels",
+    y = "Predicted Accuracy",
+    color = "Label Position",
+    fill = "Label Position"
+  ) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0.8, 1)) +
+  theme_minimal()
+
+ggsave('acc_interaction_plot.png', bg = "transparent", width = 6, height = 4, dpi = 300)
+```
+
+
+
+# Assumptions
+
+rt placement
+```{r}
+# Extract residuals and fitted values
+resid_rt <- resid(rt_position)
+fitted_rt <- fitted(rt_position)
+
+# Histogram of residuals
+hist(resid_rt, breaks = 50, main = "Residuals Histogram", xlab = "Residuals")
+
+# QQ plot
+qqnorm(resid_rt)
+qqline(resid_rt)
+
+# Residuals vs. fitted
+plot(fitted_rt, resid_rt,
+     xlab = "Fitted values", ylab = "Residuals",
+     main = "Residuals vs Fitted")
+abline(h = 0, col = "red", lty = 2)
+```
+
+rt n labels
+```{r}
+# Extract residuals and fitted values
+resid_rt <- resid(rt_nLabels)
+fitted_rt <- fitted(rt_nLabels)
+
+# Histogram of residuals
+hist(resid_rt, breaks = 50, main = "Residuals Histogram", xlab = "Residuals")
+
+# QQ plot
+qqnorm(resid_rt)
+qqline(resid_rt)
+
+# Residuals vs. fitted
+plot(fitted_rt, resid_rt,
+     xlab = "Fitted values", ylab = "Residuals",
+     main = "Residuals vs Fitted")
+abline(h = 0, col = "red", lty = 2)
+```
+
+rt interaction
+```{r}
+# Extract residuals and fitted values
+resid_rt <- resid(rt_interaction)
+fitted_rt <- fitted(rt_interaction)
+
+# Histogram of residuals
+hist(resid_rt, breaks = 50, main = "Residuals Histogram", xlab = "Residuals")
+
+# QQ plot
+qqnorm(resid_rt)
+qqline(resid_rt)
+
+# Residuals vs. fitted
+plot(fitted_rt, resid_rt,
+     xlab = "Fitted values", ylab = "Residuals",
+     main = "Residuals vs Fitted")
+abline(h = 0, col = "red", lty = 2)
+```
+
+acc placement
+```{r}
+overdisp_fun <- function(model) {
+  rdf <- df.residual(model)
+  rp <- residuals(model, type = "pearson")
+  Pearson.chisq <- sum(rp^2)
+  ratio <- Pearson.chisq / rdf
+  p <- pchisq(Pearson.chisq, df = rdf, lower.tail = FALSE)
+  c(chisq = Pearson.chisq, ratio = ratio, rdf = rdf, p = p)
+}
+```
+
+```{r}
+# overdispersion
+overdisp_fun(ac_position_slope)
+
+# predicted vs actual values
+df_trimmed$predicted <- predict(ac_position_slope, type = "response")
+
+ggplot(df_trimmed, aes(x = predicted, y = accuracy)) +
+  geom_jitter(width = 0.05, height = 0.05, alpha = 0.3) +
+  geom_smooth(method = "loess", se = FALSE) +
+  labs(x = "Predicted probability", y = "Observed accuracy")
+```
+
+acc n labels
+```{r}
+# overdispersion
+overdisp_fun(ac_nLabels)
+
+# predicted vs actual values
+df_trimmed$predicted <- predict(ac_nLabels, type = "response")
+
+ggplot(df_trimmed, aes(x = predicted, y = accuracy)) +
+  geom_jitter(width = 0.05, height = 0.05, alpha = 0.3) +
+  geom_smooth(method = "loess", se = FALSE) +
+  labs(x = "Predicted probability", y = "Observed accuracy")
+```
+
+acc interaction
+```{r}
+#overdispersion
+overdisp_fun(ac_interaction)
+
+# predicted vs actual values
+df_trimmed$predicted <- predict(ac_interaction, type = "response")
+
+ggplot(df_trimmed, aes(x = predicted, y = accuracy)) +
+  geom_jitter(width = 0.05, height = 0.05, alpha = 0.3) +
+  geom_smooth(method = "loess", se = FALSE) +
+  labs(x = "Predicted probability", y = "Observed accuracy")
+```
+

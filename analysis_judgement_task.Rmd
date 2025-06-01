@@ -1,0 +1,1223 @@
+---
+title: "clean_judgement_analysis"
+author: "Sille Hasselbalch Markussen"
+date: "5/13/2025"
+output: html_document
+---
+
+# Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+pacman::p_load('tidyverse', 'lme4', 'lmerTest', 'ordinal', 'ggeffects', 'car', 'stringr', 'emmeans', "ggrepel")
+```
+
+
+# Data load and preprocessing
+```{r message=FALSE}
+# Define the path to your folder
+folder_path <- "judgement2804"
+
+# Get a list of all CSV files in that folder
+csv_files <- list.files(path = folder_path, pattern = "*.csv", full.names = TRUE)
+
+# Read and combine them into one dataframe
+df <- csv_files %>%
+  map_dfr(read_csv, show_col_types = FALSE)
+
+df <- df %>%
+  filter(trialType != "test")
+```
+
+Rename variables, relevel and set order
+```{r}
+df <- df %>%
+  rename(
+    phase = trialType,
+    condition = scaleCondition,
+    trueLabel = basketLabel
+  ) %>%
+  mutate(condition = dplyr::recode(condition,
+                            "labels" = "noSupport",
+                            "original" = "semanticSupport",
+                            "linear" = "visuospatialSupport"),
+         phase =  dplyr::recode(phase,
+                            "experimental" = "Intervention",
+                            "baseline" = "Baseline")) 
+
+
+df$phase <- as.factor(df$phase)
+df$income <- as.factor(df$income)
+df$occupation <- as.factor(df$occupation)
+df$phase <- relevel(df$phase, ref = "Baseline")
+
+# Set the correct order for condition
+df$condition <- factor(df$condition, 
+                       levels = c("noSupport", "semanticSupport", "visuospatialSupport"),
+                       labels = c("No additional support", "Semantic support", "Visuospatial support"))
+df$phase <- factor(df$phase, levels = c("Baseline", "Intervention"))
+
+```
+
+Error and accuracy
+```{r}
+# Convert labels to numeric as before
+label_to_numeric <- function(label) {
+  return(match(label, c("A", "B", "C", "D", "E")))
+}
+
+df$true_numeric <- label_to_numeric(df$trueLabel)
+df$selected_numeric <- label_to_numeric(df$selectedLabel)
+
+# Calculate error
+df$error <- abs(df$selected_numeric - df$true_numeric)
+df$signed_error <- df$selected_numeric - df$true_numeric
+
+df <- df %>% 
+  mutate(accuracy = as.numeric(selectedLabel == trueLabel))
+```
+
+High emission
+```{r}
+df <- df %>%
+  mutate(high_impact = trueLabel %in% c("D", "E"))
+
+df$high_impact <- factor(df$high_impact, levels = c(TRUE, FALSE), labels = c("High", "Low"))
+df$high_impact <- factor(df$high_impact, levels = c("Low", "High"))
+```
+
+Mixed baskets
+```{r}
+df_items <- read_csv('items.csv',show_col_types = FALSE)
+
+# Clean names in both dataframes (trim whitespace)
+df_main <- df %>%
+  mutate(itemNames = str_trim(itemNames)) %>%
+  dplyr::mutate(row_id = dplyr::row_number())
+
+df_items <- df_items %>%
+  mutate(item = str_trim(item))  # Make sure 'item' matches itemNames
+
+# Split the itemNames column so each row has one item
+df_long <- df_main %>%
+  separate_rows(itemNames, sep = ",") %>%
+  mutate(itemNames = str_trim(itemNames))  # remove any whitespace
+
+df_long <- df_long %>%
+  left_join(df_items %>% select(item, label), by = c("itemNames" = "item"))
+
+# Create basket type per basket (you need an ID column, here assumed as `row_id`)
+df_basket_labels <- df_long %>%
+  group_by(row_id) %>%
+  summarise(
+    labels_in_basket = list(unique(label)),
+    is_mixed = any(label %in% c("D", "E")) & any(label %in% c("A", "B")),
+    is_uniform_high = all(label %in% c("D", "E")),
+    .groups = "drop"
+)
+
+# Merge back into original df
+df_main <- df_main %>%
+  mutate(row_id = row_number()) %>%
+  left_join(df_basket_labels, by = "row_id")
+
+
+# Create basket type factor
+df_main <- df_main %>%
+  mutate(basket_type = case_when(
+    is_uniform_high ~ "uniform_high",
+    is_mixed ~ "mixed",
+    TRUE ~ "other"
+  ))
+
+df_main <- df_main %>%
+  mutate(mixedBasket = basket_type == "mixed")
+
+df_main$mixedBasket <- factor(df_main$mixedBasket, levels = c(TRUE, FALSE), labels = c("Mixed", "Other"))
+
+df_main$mixedBasket <- factor(df_main$mixedBasket, levels = c("Other", "Mixed"))
+```
+
+Delta certainty
+```{r}
+
+# Compute mean certainty per participant per phase
+certainty_summary <- df %>%
+  group_by(participantId, phase) %>%
+  summarise(mean_certainty = mean(certainty, na.rm = TRUE), .groups = "drop")
+
+# Reshape to wide format
+certainty_wide <- certainty_summary %>%
+  pivot_wider(names_from = phase, values_from = mean_certainty)
+
+# Calculate delta certainty
+certainty_wide <- certainty_wide %>%
+  mutate(delta_certainty = Intervention - Baseline)
+
+
+# Prepare data for model - include condition
+model_data <- df %>%
+  select(participantId, condition) %>%
+  distinct() %>%
+  inner_join(certainty_wide, by = "participantId")
+```
+
+
+
+
+# Models
+
+Absolute error
+```{r}
+absErrorModel <- lmer(error ~ phase*condition + (1 | participantId), data = df)
+summary(absErrorModel)
+```
+
+```{r}
+# Absolute error - clmm check
+df$abs_error_factor <- as.factor(df$error)
+
+clmm_error_model <- clmm(abs_error_factor ~ phase * condition + (1|participantId), data = df)
+summary(clmm_error_model)
+```
+
+Directional error
+```{r}
+signedErrorModel <- lmer(signed_error ~ phase*condition + (1 | participantId), data = df)
+summary(signedErrorModel)
+```
+
+High emission baskets - directional error
+```{r}
+model_highImpact <- lmer(signed_error ~ high_impact * phase * condition + (1 | participantId), data = df)
+summary(model_highImpact)
+```
+
+Mixed baskets
+```{r}
+model_mixedBasket <- lmer(signed_error ~ mixedBasket * phase * condition + (1 | participantId), data = df_main)
+summary(model_mixedBasket)
+```
+
+Certainty 
+- Certainty ~ condition * phase
+```{r}
+certainty_model <- lmer(certainty ~ phase*condition + (1 | participantId),data = df)
+summary(certainty_model)
+```
+
+- Certainty ~ Accuracy
+```{r}
+certaintyAccuracy_model <- lmer(certainty ~ accuracy*phase*condition + (1 | participantId),data = df)
+summary(certaintyAccuracy_model)
+```
+
+- Delta certainty ~ condition
+```{r}
+# Run a linear model
+delta_Certainty_model <- lm(delta_certainty ~ condition, data = model_data)
+summary(delta_Certainty_model)
+```
+
+
+
+# Plots - THESIS
+Manual colours:
+```{r}
+# Custom colours
+farver <- c(
+  "Visuospatial support" = "#e4c358",
+  "Semantic support" = "#007A6C",
+  "No additional support" = "#034D69"
+)
+```
+
+
+Absolute error - point plot
+```{r}
+# Predictions
+plot_abs_error <- ggpredict(absErrorModel, terms = c("phase", "condition"))
+
+# Create shaded rectangle data for the Baseline phase
+baseline_rect_abs <- data.frame(
+  xmin = 0.5,
+  xmax = 1.5,
+  ymin = -Inf,
+  ymax = Inf
+)
+
+ggplot(plot_abs_error, aes(x = x, y = predicted, color = group)) +
+  geom_point(position = position_dodge(0.5), size = 2.5) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.1, position = position_dodge(0.5)) +
+  geom_rect(data = baseline_rect_abs,
+            aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+            fill = "grey60", alpha = 0.2, inherit.aes = FALSE) +
+  scale_color_manual(values = farver, labels = c(
+    "No additional support   ",         # add spaces after label
+    "Semantic support   ",
+    "Visuospatial support")) +
+  labs(
+    #title = "Accuracy (absolute error from correct label)",
+    x = "",
+    y = "Predicted Absolute Error",
+    color = "Support condition"
+  ) +
+  scale_y_continuous(limits = c(0, 1)) +
+  guides(color = guide_legend(override.aes = list(linetype = 0,
+                                                  shape = 16,
+                                                  size = 3),
+                              label.position = "right",           # label right of dot
+                              keywidth = unit(-5, "cm"),         # tiny space before label
+                              default.unit = "cm"))+
+  theme_minimal()+
+  theme(
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 8.5),
+    legend.key = element_blank(),               
+    legend.box.spacing = unit(-0.1, "cm"),
+    plot.title = element_text(hjust = 0.5),
+    plot.margin = margin(t = 5, r = 25, b = 5, l = 25)
+  )+
+  coord_cartesian(clip="off")
+
+
+
+
+ggsave("thesis_figures/abs_error_pointPlot.png", width = 5, height = 4, dpi = 300)
+```
+
+Directional error - point plot
+```{r}
+# Predictions
+plot_signed_error <- ggpredict(signedErrorModel, terms = c("phase", "condition"))
+
+# Create shaded rectangle data for the Baseline phase
+baseline_rect_signed <- data.frame(
+  xmin = 0.5,
+  xmax = 1.5,
+  ymin = -Inf,
+  ymax = Inf
+)
+
+ggplot(plot_signed_error, aes(x = x, y = predicted, color = group)) +
+  geom_point(position = position_dodge(0.5), size = 2.5) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.1, position = position_dodge(0.5)) +
+  geom_rect(data = baseline_rect_signed,
+            aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+            fill = "grey60", alpha = 0.2, inherit.aes = FALSE) +
+  scale_color_manual(values = farver, labels = c("No Additional support   ",         # add spaces after label
+                                                 "Semantic support   ",
+                                                 "Visuospatial support")) +
+  guides(color = guide_legend(override.aes = list(linetype = 0,
+                                                  shape = 16,
+                                                  size = 3),
+                              label.position = "right",           # label right of dot
+                              keywidth = unit(-5, "cm"),         # tiny space before label
+                              default.unit = "cm"))+
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  annotate("text", x = max(as.numeric(plot_signed_error$x)) + 0.18, 
+           y = -0.05, label = "Perfect accuracy", hjust = 0, size = 2.6, color = "black") +  
+  labs(
+    #title = "General underestimation bias",
+    x = "",
+    y = "Predicted Directional Error",
+    color = "Support condition"
+  ) +
+  theme_minimal()+
+  scale_y_continuous(limits = c(-1, 1)) +
+  theme(legend.position = "bottom",
+        legend.title = element_blank(),
+        legend.text = element_text(size = 8.5),
+        legend.key = element_blank(),
+        legend.box.spacing = unit(-0.1, "cm"),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.margin = margin(5, 25, 5, 25))+
+  coord_cartesian(clip="off")
+
+
+ggsave("thesis_figures/signed_error_pointPlot.png", width = 5, height = 4, dpi = 300, bg = "transparent")
+
+```
+
+High emission - point plot
+```{r}
+
+
+# Create label data manually for the right facet
+label_data <- data.frame(x = 2.3, y = 0.08, label = "Perfect accuracy", facet = factor("High", levels = c("Low", "High")))
+
+baseline_rect <- data.frame(
+  facet = factor(c("Low", "High"), levels = c("Low", "High")),
+  xmin = 0.5,
+  xmax = 1.5,
+  ymin = -Inf,
+  ymax = Inf
+)
+
+
+# Predictions including high_impact
+plot_highImpact_error <- ggpredict(model_highImpact, terms = c("phase", "condition", "high_impact"))
+
+
+plot_highImpact_error$facet <- factor(plot_highImpact_error$facet, levels = c("Low", "High"))
+
+
+
+# Plot
+ggplot(plot_highImpact_error, aes(x = x, y = predicted, color = group)) +
+  geom_point(position = position_dodge(0.5), size = 2.5) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.1, position = position_dodge(0.5)) +
+  geom_rect(data = baseline_rect,
+            aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+            fill = "grey60", alpha = 0.2, inherit.aes = FALSE) +
+  facet_wrap(~facet, labeller = as_labeller(c("High" = "High-emission baskets", "Low" = "Low-emission baskets"))) +
+  scale_color_manual(values = farver, labels = c("No Additional support   ",         # add spaces after label
+                                                 "Semantic support   ",
+                                                 "Visuospatial support")) +
+  guides(color = guide_legend(override.aes = list(linetype = 0,
+                                                  shape = 16,
+                                                  size = 3),
+                              label.position = "right",           # label right of dot
+                              keywidth = unit(-5, "cm"),         # tiny space before label
+                              default.unit = "cm"))+
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_label(data = label_data, aes(x = x, y = y, label = label),
+             inherit.aes = FALSE, color = "black", fill = "white",
+             label.size = NA, size = 2.6)+
+
+  labs(#title = "High-Emission bias",
+    x = "",
+    y = "Predicted Directional Error",
+    color = "Support condition"
+  ) +
+  scale_y_continuous(limits = c(-1.1, 1)) +
+  theme_minimal() +
+  theme(legend.position = "bottom", 
+        legend.title = element_blank(),
+        legend.text = element_text(size = 8.5),
+        strip.text = element_text(size = 12),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.margin = margin(5, 25, 5, 25))+
+  coord_cartesian(clip="off")
+
+ggsave("thesis_figures/highEmission_error_pointPlot.png", width = 6.5, height = 4, dpi = 300, bg = "transparent")
+
+```
+
+Mixed baskets
+
+```{r}
+# Create label data for the right facet
+label_data_mixed <- data.frame(
+  x = 2.3,  # adjust to place right of rightmost group
+  y = -0.08,
+  label = "Perfect accuracy",
+  facet = factor("Mixed", levels = c("Other", "Mixed"))
+)
+
+# Make sure facet column in your main data matches this
+plot_mixed_error <- ggpredict(model_mixedBasket, terms = c("phase", "condition", "mixedBasket"))
+plot_mixed_error$facet <- factor(plot_mixed_error$facet, levels = c("Other", "Mixed"))
+
+# Create shaded baseline rectangles for both facets
+baseline_rect_mixed <- data.frame(
+  facet = factor(c("Other", "Mixed"), levels = c("Other", "Mixed")),
+  xmin = 0.5,
+  xmax = 1.5,
+  ymin = -Inf,
+  ymax = Inf
+)
+
+# Plot
+ggplot(plot_mixed_error, aes(x = x, y = predicted, color = group)) +
+  geom_rect(data = baseline_rect_mixed,
+            aes(xmin = xmin, xmax = xmax, ymin = ymin, ymax = ymax),
+            fill = "grey60", alpha = 0.2, inherit.aes = FALSE) +
+  geom_point(position = position_dodge(0.5), size = 2.5) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.1, position = position_dodge(0.5)) +
+  facet_wrap(~facet, labeller = as_labeller(c("Other" = "Other baskets", "Mixed" = "Mixed baskets"))) +
+  scale_color_manual(values = farver, labels = c("No additional support   ",         
+                                                 "Semantic support   ",
+                                                 "Visuospatial support")) +
+  guides(color = guide_legend(override.aes = list(linetype = 0,
+                                                  shape = 16,
+                                                  size = 3),
+                              label.position = "right",
+                              keywidth = unit(-5, "cm"),
+                              default.unit = "cm")) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_label(data = label_data_mixed,
+             aes(x = x, y = y, label = label),
+             inherit.aes = FALSE, color = "black", fill = "white", label.size = NA, size = 2.6) +
+  labs(
+    x = "",
+    y = "Predicted Directional Error",
+    color = "Support condition"
+  ) +
+  scale_y_continuous(limits = c(-1.1, 1)) +
+  theme_minimal() +
+  theme(legend.position = "bottom", 
+        legend.title = element_blank(),
+        legend.text = element_text(size = 8.5),
+        strip.text = element_text(size = 12),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.margin = margin(5, 25, 5, 25)) +
+  coord_cartesian(clip = "off")
+
+ggsave("thesis_figures/mixed_error_pointPlot.png", width = 6.5, height = 4, dpi = 300, bg = "transparent")
+
+```
+
+mixed without rectangles
+```{r}
+# Create label data
+label_data_mixed <- data.frame(
+  x = "Intervention",
+  predicted = 0,
+  facet = factor("Mixed", levels = c("Other", "Mixed")) # must be a factor with same levels
+)
+
+# Predictions
+plot_mixed_error <- ggpredict(model_mixedBasket, terms = c("phase", "condition", "mixedBasket"))
+
+
+# Plot
+ggplot(plot_mixed_error, aes(x = x, y = predicted, color = group)) +
+  geom_point(position = position_dodge(0.5), size = 2.5) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.1, position = position_dodge(0.5)) +
+  facet_wrap(~facet, labeller = as_labeller(c("Other" = "Other baskets", "Mixed" = "Mixed baskets"))) +
+  scale_color_manual(values = farver, labels = c("No visual support   ",         # add spaces after label
+                                                 "Semantic support   ",
+                                                 "Visuospatial support")) +
+  guides(color = guide_legend(override.aes = list(linetype = 0,
+                                                  shape = 16,
+                                                  size = 3),
+                              label.position = "right",           # label right of dot
+                              keywidth = unit(-5, "cm"),         # tiny space before label
+                              default.unit = "cm"))+
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_label(data = label_data_mixed, aes(x = max(as.numeric(plot_mixed_error$x)) + 0.28, y = -0.1, label = "Perfect accuracy"), 
+           inherit.aes = FALSE, color = "black", fill = "white", label.size = 0, size = 2.5)+
+  labs(
+    #title = "Mixed-bakset bias",
+    x = "",
+    y = "Predicted Directional Error",
+    color = "Support condition"
+  ) +
+  scale_y_continuous(limits = c(-1.1, 1)) +
+  theme_minimal() +
+  theme(legend.position = "bottom", 
+        strip.text = element_text(size = 12),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        plot.margin = margin(5, 25, 5, 25))+
+  coord_cartesian(clip="off")
+
+ggsave("thesis_figures/mixed_error_pointPlot.png", width = 6.5, height = 4, dpi = 300, bg = "transparent")
+```
+
+Certainty
+```{r}
+# Predictions
+plot_certainty <- ggpredict(certainty_model, terms = c("phase", "condition"))
+
+
+
+ggplot(plot_certainty, aes(x = x, y = predicted, color = group)) +
+  geom_point(position = position_dodge(0.5), size = 2.5) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.1, position = position_dodge(0.5)) +
+  scale_color_manual(values = farver) +
+  labs(
+    x = "",
+    y = "Predicted certainty",
+    color = "Scale condition"
+  ) +
+  theme_minimal()+
+  scale_y_continuous(limits = c(0.5, 7.5)) +
+  theme(legend.position = "bottom")
+```
+
+Delta certainty
+```{r}
+# Predictions
+plot_delta_certainty <- ggpredict(delta_Certainty_model, terms = c("condition"))
+
+ggplot(plot_delta_certainty, aes(x = group, y = predicted, color = x)) +
+  geom_point(position = position_dodge(0.5), size = 3) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                width = 0.1,
+                position = position_dodge(0.5)) +
+  scale_color_manual(values = farver, labels = c("No additional support   ",         # add spaces after label
+                                                 "Semantic support   ",
+                                                 "Visuospatial support")) +
+  guides(color = guide_legend(override.aes = list(linetype = 0,
+                                                  shape = 16,
+                                                  size = 3),
+                              label.position = "right",           # label right of dot
+                              keywidth = unit(-5, "cm"),         # tiny space before label
+                              default.unit = "cm"))+
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  annotate("text", x = 1.2, 
+           y = 0.1, label = "No difference between conditions", hjust = 0, size = 2.6, color = "black") + 
+  labs(
+    #title = "Confidence",
+    x = "",
+    y = "Predicted Δ Certainty",
+    color = "Support condition"
+  ) +
+  scale_y_continuous(limits = c(-1.5, 1.5)) +
+  theme_minimal() +
+  theme(legend.position = "bottom", 
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 8.5),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  coord_cartesian(clip = "off")
+
+ggsave("thesis_figures/confidence_pointPlot.png", width = 5, height = 4, dpi = 300)
+
+```
+
+
+# Plots - REPORT
+
+ Vertical bar plot (function)
+```{r}
+plot_signed_error <- function(data, title_text = NULL, y_limits = c(-2, 2)) {
+  
+  ggplot(data, aes(x = x, y = predicted, fill = group)) +
+    geom_col(position = position_dodge2(0.75, reverse = FALSE, padding = 0.05), width = 0.6) +
+
+    # Annotate reference lines and labels
+    annotate("text", x = 0.04, y = 0, hjust = 0, label = "Korrekt\nvurdering",
+          family = "Times", fontface = "italic", color = "#034D69", size = 4)+
+    annotate("text", x = 0.05, y = 1, hjust = 0, label = "Overvurdering", 
+           color = "#034D69", family = "Times", fontface = "italic", size = 4) +
+    annotate("text", x = 0.05, y = -1, hjust = 0, label = "Undervurdering", 
+           color = "#034D69", family = "Times", fontface = "italic", size = 4)+
+    annotate("text", x = 1, y = 0.9, label = "Del 1", fontface = "bold", 
+         family = "Times", size = 4.5, hjust = 0.5, color = "#034D69") +
+    annotate("text", x = 2, y = 0.9, label = "Del 2", fontface = "bold", 
+         family = "Times", size = 4.5, hjust = 0.5, color = "#034D69") +
+    annotate("text", x = 1, y = 0.8, label = "Kontrolfase uden støtte", 
+         family = "Times", size = 4.5, hjust = 0.5, color = "#034D69") +
+    annotate("text", x = 2, y = 0.8, label = "Interventionsfase med støtte",
+         family = "Times", size = 4.5, hjust = 0.5, color = "#034D69") +
+    annotate("segment", x = -0, xend = Inf, y = 0, yend = 0, 
+         linetype = "dashed", colour = "#034D69", linewidth = 0.5)+
+  
+
+    # Scales and labels
+    scale_fill_manual(values = farver) +
+  
+    scale_y_continuous(limits = c(-1, 1),
+                     breaks = c(-1, 0, 1),
+                     labels = c("-1", "0", "+1")) +
+
+    coord_cartesian(clip = "off") +
+    labs(
+      title = title_text,
+      x = "",
+      y = expression("Gennemsnitlig afvigelse fra korrekt CO"[2]*"-mærke"),
+      fill = "Grad af visuel støtte"
+    ) +
+
+    # Theme
+    theme_minimal(base_size = 14, base_family = "Times") +
+    theme(
+      panel.grid = element_blank(),
+      panel.background = element_blank(),
+      plot.background = element_blank(),
+      legend.position = "none",
+      axis.title = element_text(face = "bold", color = "#034D69", vjust = +0.7),
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.text.y = element_text(color = "#034D69"),
+      axis.line.y = element_line(color = "#034D69", linewidth = 0.6),
+      axis.ticks.y = element_line(color = "#034D69"),
+      plot.title = element_text(size = 16, face = "bold", color = "#034D69", hjust = 0.5),
+      plot.margin = margin(t = 5, r = 10, b = 5, l = 10)
+    )
+}
+
+# Custom colours
+farver <- c(
+  "Visuospatial support" = "#e4c358",
+  "Semantic support" = "#007A6C",
+  "No visual support" = "#034D69"
+)
+
+```
+
+Vertical bar plot INTERVENTION ONLY  (function)
+```{r}
+plot_intervention_signed_error <- function(data, title_text = NULL, y_limits = c(-1, 1)) {
+  
+  # Behold kun Intervention-fase
+  data <- data %>% filter(x == "Intervention")
+  
+  ggplot(data, aes(x = group, y = predicted, fill = group)) +
+    geom_col(position = position_dodge2(0.75, reverse = FALSE, padding = 0.05), width = 0.6) +
+
+    annotate("segment", x = -Inf, xend = Inf, y = 0, yend = 0, 
+             linetype = "dashed", colour = "#034D69", linewidth = 0.5) +
+
+    # Skala og labels
+    scale_fill_manual(values = farver) +
+    scale_y_continuous(limits = y_limits,
+                       breaks = c(-1, 0, 1),
+                       labels = c("-1", "0", "+1")) +
+
+    coord_cartesian(clip = "off") +
+    labs(
+      title = title_text,
+      x = "",
+      y = NULL,  # Fjern y-aksen titel
+      fill = "Grad af visuel støtte"
+    ) +
+
+    # Tema
+    theme_minimal(base_size = 14, base_family = "Times") +
+    theme(
+      panel.grid = element_blank(),
+      panel.background = element_blank(),
+      plot.background = element_blank(),
+      legend.position = "none",
+      axis.title = element_text(face = "bold", color = "#034D69", vjust = +0.7),
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.text.y = element_text(color = "#034D69"),
+      axis.line.y = element_line(color = "#034D69", linewidth = 0.6),
+      axis.ticks.y = element_line(color = "#034D69"),
+      plot.title = element_text(size = 16, face = "bold", color = "#034D69", hjust = 0.5),
+      plot.margin = margin(t = 5, r = 10, b = 5, l = 10)
+    )
+}
+
+```
+
+
+Directional error
+- Only intervention
+```{r}
+# Get predicted values
+pred_signed_error <- ggpredict(signedErrorModel, terms = c("phase", "condition"))
+
+# plot
+plot_intervention_signed_error(pred_signed_error)
+
+# save
+ggsave("report_figures/signed_error_intervention_plot.png", width = 6.5, height = 4.5, dpi = 300, bg = "transparent")
+```
+
+- with phases
+```{r}
+# Get predicted values
+pred_signed_error <- ggpredict(signedErrorModel, terms = c("phase", "condition"))
+
+# Plot
+plot_signed_error(
+  data = pred_signed_error,
+  title_text = ""
+)
+# Save
+ggsave("report_figures/signed_error_plot.png", width = 6.5, height = 4.5, dpi = 300, bg = "transparent")
+
+```
+
+
+High emission
+- only intervention
+```{r}
+plot_highImpact_error <- ggpredict(model_highImpact, terms = c("phase", "condition", "high_impact"))
+plot_high <- subset(plot_highImpact_error, facet == "High")
+
+# Plot high emission (D or E)
+plot_signed_error(data = plot_high)
+
+# Save
+ggsave("report_figures/highEmission_error_intervention_plot.png", width = 6.5, height = 4.5, dpi = 300, bg = "transparent")
+
+
+```
+
+- with both phases
+```{r}
+# Get predictions
+plot_highImpact_error <- ggpredict(model_highImpact, terms = c("phase", "condition", "high_impact"))
+
+# Filter  data
+plot_high <- subset(plot_highImpact_error, facet == "High")
+
+# Plot high emission (D or E)
+plot_signed_error(
+  data = plot_high,
+  title_text = expression("Kurve med højt gennemsnitligt CO"[2]*"-aftryk")
+)
+
+# Save
+ggsave("report_figures/highEmission_error_plot.png", width = 6.5, height = 4.5, dpi = 300, bg = "transparent")
+
+```
+
+Low emission
+- with both phases
+```{r}
+plot_low <- subset(plot_highImpact_error, facet == "Low")
+# Plot low emission (A–C)
+plot_signed_error(
+  data = plot_low,
+  title_text = expression("Kurve med lavt gennemsnitligt CO"[2]*"-aftryk")
+)
+
+# Save
+ggsave("report_figures/lowEmission_error_plot.png", width = 6.5, height = 4.5, dpi = 300, bg = "transparent")
+
+```
+
+
+Mixed
+- only intervention
+```{r}
+# predction
+plot_mixed_error <- ggpredict(model_mixedBasket, terms = c("phase", "condition", "mixedBasket"))
+
+# subset
+plot_mixed <- subset(plot_mixed_error, facet == "Mixed")
+
+# plot
+plot_intervention_signed_error(data = plot_mixed )
+
+# Save
+ggsave("report_figures/mixed_error_intervention_plot.png", width = 6.5, height = 4.5, dpi = 300, bg = "transparent")
+
+```
+
+- with both phases
+```{r}
+# Get predictions
+plot_mixed_error <- ggpredict(model_mixedBasket, terms = c("phase", "condition", "mixedBasket"))
+
+# Filter data
+plot_mixed <- subset(plot_mixed_error, facet == "Mixed")
+
+# Plot
+plot_signed_error(
+  data = plot_mixed,
+  title_text = expression("Indkøbskurve med både klimavenlige og klimabelastende varer")
+)
+
+# Save
+ggsave("report_figures/mixed_error_plot.png", width = 6.5, height = 4.5, dpi = 300, bg = "transparent")
+```
+
+Other
+```{r}
+# Get predictions
+plot_mixed_error <- ggpredict(model_mixedBasket, terms = c("phase", "condition", "mixedBasket"))
+
+# Filter data
+plot_other <- subset(plot_mixed_error, facet == "Other")
+
+# Plot
+plot_signed_error(
+  data = plot_other,
+  title_text = expression("Indkøbskurve med varer uden stor forskel i klimaaftryk")
+)
+
+# Save
+ggsave("report_figures/other_error_plot.png", width = 6.5, height = 4.5, dpi = 300, bg = "transparent")
+```
+
+Delta certainty - horizontal bar
+```{r}
+
+plot_delta_certainty <- ggpredict(delta_Certainty_model, terms = c( "condition"))
+
+
+ggplot(plot_delta_certainty, aes(y = x, x = predicted, fill = x)) +
+  geom_col(width = 0.6) +
+  #geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
+  scale_fill_manual(values = farver, guide = guide_legend(reverse = FALSE)) +
+  
+  # Annotations
+  annotate("segment", y = -Inf, yend = Inf, x = 0, xend = 0,
+           linetype = "dashed", colour = "#034D69", linewidth = 0.5) +
+  
+  labs(
+    y = "",
+    x = "",
+    fill = ""
+  ) +
+  
+  scale_x_continuous(limits = c(-1.2, 1.2),  position = "top")+#, breaks = seq(-1.5, 0.5, 0.5), expand = c(0, 0)) +
+  scale_y_discrete(labels = c(
+    "No visual support" = "Ingen visuel støtte",
+    "Semantic support" = "Semantisk støtte",
+    "Visuospatial support" = "Rummelig støtte"))+
+  # Theme
+  theme_minimal(base_size = 14, base_family = "Times") +
+  theme(
+    panel.grid = element_blank(),
+    panel.background = element_blank(),
+    plot.background = element_blank(),
+    legend.position = "none",
+    axis.title.x = element_text(face = "bold", color = "#034D69"),
+    axis.text.x = element_text(color = "#034D69"),
+    axis.text.y = element_blank(),
+    axis.line.x = element_line(color = "#034D69", linewidth = 0.6),
+    axis.ticks.x = element_line(color = "#034D69"),
+    plot.margin = margin(t = 5, r = 5, b = 5, l = -5)
+  )
+
+# Save
+ggsave("report_figures/certainty_vertical_plot.png", width = 6, height = 4.5, dpi = 300, bg = "transparent")
+
+```
+
+
+# Assumptions
+
+Absolute error
+```{r}
+# Extract residuals and fitted values
+resid_abs <- resid(absErrorModel)
+fitted_abs <- fitted(absErrorModel)
+
+# Histogram of residuals
+hist(resid_abs, breaks = 50, main = "Residuals Histogram", xlab = "Residuals")
+
+# QQ plot
+qqnorm(resid_abs)
+qqline(resid_abs)
+
+# Residuals vs. fitted
+plot(fitted_abs, resid_abs,
+     xlab = "Fitted values", ylab = "Residuals",
+     main = "Residuals vs Fitted")
+abline(h = 0, col = "red", lty = 2)
+```
+
+Directional error
+```{r}
+# Extract residuals and fitted values
+resid_signed <- resid(signedErrorModel)
+fitted_signed <- fitted(signedErrorModel)
+
+# Histogram of residuals
+hist(resid_signed, breaks = 50, main = "Residuals Histogram", xlab = "Residuals")
+
+# QQ plot
+qqnorm(resid_signed)
+qqline(resid_signed)
+
+# Residuals vs. fitted
+plot(fitted_signed, resid_signed,
+     xlab = "Fitted values", ylab = "Residuals",
+     main = "Residuals vs Fitted")
+abline(h = 0, col = "red", lty = 2)
+```
+
+High Emission
+```{r}
+# Extract residuals and fitted values
+resid_high <- resid(model_highImpact)
+fitted_high <- fitted(model_highImpact)
+
+# Histogram of residuals
+hist(resid_high, breaks = 50, main = "Residuals Histogram", xlab = "Residuals")
+
+# QQ plot
+qqnorm(resid_high)
+qqline(resid_high)
+
+# Residuals vs. fitted
+plot(fitted_high, resid_high,
+     xlab = "Fitted values", ylab = "Residuals",
+     main = "Residuals vs Fitted")
+abline(h = 0, col = "red", lty = 2)
+
+```
+
+Mixed
+```{r}
+# Extract residuals and fitted values
+resid_mixed <- resid(model_mixedBasket)
+fitted_mixed <- fitted(model_mixedBasket)
+
+# Histogram of residuals
+hist(resid_mixed, breaks = 50, main = "Residuals Histogram", xlab = "Residuals")
+
+# QQ plot
+qqnorm(resid_mixed)
+qqline(resid_mixed)
+
+# Residuals vs. fitted
+plot(fitted_mixed, resid_mixed,
+     xlab = "Fitted values", ylab = "Residuals",
+     main = "Residuals vs Fitted")
+abline(h = 0, col = "red", lty = 2)
+```
+
+Certainty
+```{r}
+# Extract residuals and fitted values
+resid_certainty <- resid(delta_Certainty_model)
+fitted_certainty <- fitted(delta_Certainty_model)
+
+# Histogram of residuals
+hist(resid_certainty, breaks = 50, main = "Residuals Histogram", xlab = "Residuals")
+
+# QQ plot
+qqnorm(resid_certainty)
+qqline(resid_certainty)
+
+# Residuals vs. fitted
+plot(fitted_certainty, resid_certainty,
+     xlab = "Fitted values", ylab = "Residuals",
+     main = "Residuals vs Fitted")
+abline(h = 0, col = "red", lty = 2)
+```
+
+
+# Demographics - plots for the report
+
+Data
+```{r}
+df_unique <- df %>%
+  distinct(participantId, gender, age, occupation, income)
+
+# Define theme
+my_theme <- theme_minimal(base_family = "Times", base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", color = "#034D69", hjust = 0.5),
+    axis.text = element_text(color = "#034D69", face = "bold", size = 12),
+    axis.title = element_text(color = "#034D69", face = "bold"),
+    axis.text.y = element_text(margin = margin(r = -12)),
+    panel.grid = element_blank(),
+    plot.background = element_blank(),
+    panel.background = element_blank()
+  )
+
+# Color
+blue <- "#034D69"
+```
+
+Gender
+```{r}
+df_unique %>%
+  count(gender) %>%
+  mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = "", y = prop, fill = gender)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar("y") +
+  geom_text(aes(label = paste0(round(prop*100), "%")), 
+            position = position_stack(vjust = 0.5), color = "white", size = 5) +
+  scale_fill_manual(values = c("Kvinde" = "#e4c358", "Mand" = "#007A6C", "Andet" = "#034D69")) +
+  labs(title = "Fordeling på køn", fill = NULL) +
+  my_theme +
+  theme(axis.text = element_blank(), axis.title = element_blank(), axis.ticks = element_blank())
+
+
+df_unique %>%
+  count(gender) %>%
+  mutate(percent = round(n / sum(n) * 100)) %>%
+  ggplot(aes(x = fct_rev(gender), y = n)) +
+  geom_col(fill = blue, width = 0.5) +
+  geom_text(aes(label = paste0(percent, "%")), hjust = -0.1, color = "#034D69", fontface = "bold", family = "times", size = 4.5) +
+  scale_fill_manual(values = gender_colors) +
+  coord_flip(clip = "off") +
+  labs(title = "Fordeling på køn", x = NULL, y = NULL) +
+  my_theme +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.margin = margin(t = 5, r = 10, b = 5, l = 5)
+  )
+
+gender_colors <- c(
+  "Kvinde" = "#689aae",  # light blue (far left)
+  "Mand" = "#84bf7c",    # dark blue (second from left)
+  "Andet" = "#095979"    # very light mint/blue (second from right)
+)
+
+df_unique %>%
+  count(gender) %>%
+  mutate(
+    percent = round(n / sum(n) * 100),
+    label = paste0(gender, "\n", percent, "%"),
+    angle = 90 - 360 * (cumsum(n) - 0.5 * n) / sum(n)
+  ) %>%
+  ggplot(aes(x = 2, y = n, fill = gender)) +
+  geom_col(width = 1, color = "white") +
+  coord_polar(theta = "y") +
+  #geom_text(aes(label = label, y = n / 2 + c(0, cumsum(n)[-length(n)])),
+         #   color = "#034D69", family = "times", fontface = "bold", size = 4.5) +
+  scale_fill_manual(values = gender_colors) +
+  xlim(0.5, 2.5) +
+  theme_void() +
+  labs(title = "Fordeling på køn") +
+  theme(
+    plot.title = element_text(hjust = 0.5, family = "times", face = "bold", colour = "#034D69"),
+    legend.position = "none",
+    plot.margin = margin(t = 5, r = 5, b = 5, l = 5)
+  )
+
+ggsave("demografi_køn_donutPlot.png", width = 6, height = 6, dpi = 300, bg = "transparent")
+
+
+
+```
+
+Age groups
+```{r}
+df_unique <- df_unique%>%
+  mutate(age_group = cut(age, 
+                         breaks = c(17, 29, 39, 49, 59, 69, Inf), 
+                         labels = c("18-29 år", "30-39 år", "40-49 år", 
+                                    "50-59 år", "60-69 år", "70+ år")))
+df_unique <- df_unique %>%
+  mutate(age_group = factor(age_group, levels = c(
+    "18-29 år", "30-39 år", "40-49 år",
+    "50-59 år", "60-69 år", "70+ år"
+  )))
+
+df_unique %>%
+  count(age_group) %>%
+  mutate(percent = round(n / sum(n) * 100)) %>%
+  ggplot(aes(x = age_group, y = n)) +
+  geom_col(fill = blue, width = 0.5) +
+  geom_text(aes(label = paste0(percent, "%")),
+            hjust = -0.2, color = blue, fontface = "bold", family = "times", size = 4.5, clip = "off") +
+  coord_flip(clip = "off") +
+  labs(title = "Aldersgrupper", x = NULL, y = NULL) +
+  my_theme +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.margin = margin(t = 5, r = 10, b = 5, l = 5)
+  )
+
+
+
+ggsave("demografi_alder_plot.png", width = 6.5, height = 4, dpi = 300, bg = "transparent")
+
+
+```
+
+Occupation
+```{r}
+df_unique %>%
+  count(occupation) %>%
+  mutate(
+    percent = round(n / sum(n) * 100),
+    occupation = fct_rev(fct_reorder(occupation, n))
+  ) %>%
+  ggplot(aes(x = occupation, y = n)) +
+  geom_col(fill = blue, width = 0.5) +
+  geom_text(aes(label = paste0(percent, "%")), 
+            hjust = -0.4, color = blue, fontface = "bold", family = "Times", size = 4.5) +
+  labs(title = "Beskæftigelse", x = NULL, y = NULL) +
+  coord_flip(clip = "off") +
+  my_theme +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.margin = margin(t = 5, r = 40, b = 5, l = 5)
+  )
+
+ggsave("demografi_beskaeftigelse_plot.png", width = 6.5, height = 3, dpi = 300, bg = "transparent")
+
+```
+
+Income
+```{r}
+
+income_levels <- c(
+  "Under 10.000",
+  "10–25.000",
+  "25–40.000",
+  "40–55.000",
+  "55–70.000",
+  "Mere end 70.000",
+  "Ønsker ikke at oplyse"
+)
+
+
+df_unique %>%
+  count(income) %>%
+  mutate(
+    percent = round(n / sum(n) * 100),
+    income = factor(income, levels = income_levels)
+  ) %>%
+  ggplot(aes(x = income, y = n)) +
+  geom_col(fill = blue, width = 0.5) +
+  geom_text(aes(label = paste0(percent, "%")),
+            hjust = -0.2, color = blue, fontface = "bold", size = 4.5, family = "Times") +
+  coord_flip(clip = "off") +
+  labs(title = "Indkomstfordeling", x = NULL, y = NULL) +
+  my_theme +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    plot.margin = margin(t = 5, r = 40, b = 5, l = 5)
+  )
+
+ggsave("demografi_indkomst_plot.png", width = 6.5, height = 4, dpi = 300, bg = "transparent")
+
+```
+
+
+
+# National scale estimate - calculations of misjudged kg co2 per misjudged high-emission basket
+```{r}
+df_high = df %>% 
+  filter(high_impact == "High")
+```
+
+```{r}
+df_high_incorrect = df_high %>% 
+  filter(error > 0)
+```
+
+```{r}
+# label midpoint mapping based on intervals
+label_midpoints <- c(
+  A = 0.55,
+  B = 1.5,
+  C = 3.75,
+  D = 7.5,
+  E = 20.5  # Precise average for ten E products used in experiment
+)
+
+# Create column with judged CO₂ based on the midpoint of selectedLabel
+df_high_incorrect$guessedCo2 <- label_midpoints[df_high_incorrect$selectedLabel]
+
+# Calculate underestimation
+df_high_incorrect$underestimation <- df_high_incorrect$weightedCo2 - df_high_incorrect$guessedCo2
+```
+
+```{r}
+# Summary statistics
+mean_judgement_error <- mean(df_high_incorrect$underestimation, na.rm = TRUE)
+total_judgement_error <- sum(df_high_incorrect$underestimation, na.rm = TRUE)
+
+underestimates <- df_high_incorrect[df_high_incorrect$underestimation > 0, ]
+n_underestimated <- nrow(underestimates)
+
+
+
+mean_underestimation <- mean(underestimates$underestimation, na.rm = TRUE)
+total_underestimation <- sum(underestimates$underestimation, na.rm = TRUE)
+
+cat("Mean misjudgement in co2 per basket:", round(mean_judgement_error, 2), "kg\n")
+cat("Total misjudgement in co2 across", n_underestimated, "trials:", round(total_judgement_error, 2), "kg\n")
+
+cat("Mean underestimation per misjudged basket:", round(mean_underestimation, 2), "kg\n")
+cat("Total underestimation across", n_underestimated, "trials:", round(total_underestimation, 2), "kg\n")
+
+```
